@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Downloaded ML model (fetched by scripts/download_models.py)
+assets/models/*.task
+
+# Local run artifacts
+*.log
+.DS_Store
