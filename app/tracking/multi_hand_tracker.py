@@ -18,6 +18,7 @@ architecture is meant to isolate behind a stable interface. This tracker:
 from __future__ import annotations
 
 import itertools
+import logging
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
@@ -26,8 +27,27 @@ from app.config.schema import DetectionConfig
 from app.vision.geometry import HandGeometry, compute_geometry
 from app.vision.landmarks import FrameResult, HandObservation
 
+logger = logging.getLogger(__name__)
+
 _MAX_MATCH_DISTANCE = 0.35  # normalized units; beyond this, treat as a different hand
 _MOTION_HISTORY_LEN = 45    # ~1.5s at 30fps
+
+
+def _hand_has_finite_landmarks(hand: HandObservation) -> bool:
+    for lm in hand.landmarks:
+        if not (_is_finite(lm.x) and _is_finite(lm.y) and _is_finite(lm.z)):
+            return False
+    if hand.world_landmarks:
+        for lm in hand.world_landmarks:
+            if not (_is_finite(lm.x) and _is_finite(lm.y) and _is_finite(lm.z)):
+                return False
+    return True
+
+
+def _is_finite(value: float) -> bool:
+    # Avoids importing numpy just for this; math.isfinite handles NaN and
+    # +/-inf identically and is what the rest of the standard library uses.
+    return value == value and value not in (float("inf"), float("-inf"))
 
 
 @dataclass
@@ -98,12 +118,31 @@ class MultiHandTracker:
     def update(self, frame: FrameResult) -> Tuple[List[HandObservation], Dict[int, HandGeometry]]:
         """Assigns stable hand_id values to the raw detections in-place
         and returns (hands, geometry_by_id). Also advances missed-frame
-        bookkeeping and prunes tracks that have been gone too long."""
+        bookkeeping and prunes tracks that have been gone too long.
+
+        This is the universal boundary between "whatever the configured
+        detector backend produced" and the rest of the app: hands with
+        any non-finite (NaN/Inf) landmark coordinate are dropped here
+        regardless of which backend produced them, so a single bad
+        detection can never propagate into smoothing, gesture geometry,
+        or (eventually) a control value like pinch-volume or a UI
+        coordinate. The MediaPipe backend already filters its own output
+        for the same reason (cheaper to skip a bad hand before it's even
+        translated); this is the backstop that protects every backend,
+        including ones that don't do that filtering themselves.
+        """
         self._frame_counter += 1
         t_seconds = frame.timestamp_ms / 1000.0
 
-        geometries = [compute_geometry(h) for h in frame.hands]
-        assigned = self._match(frame.hands, geometries, t_seconds)
+        finite_hands = [h for h in frame.hands if _hand_has_finite_landmarks(h)]
+        if len(finite_hands) != len(frame.hands):
+            logger.debug(
+                "Discarded %d hand(s) with non-finite landmark coordinates this frame.",
+                len(frame.hands) - len(finite_hands),
+            )
+
+        geometries = [compute_geometry(h) for h in finite_hands]
+        assigned = self._match(finite_hands, geometries, t_seconds)
 
         geometry_by_id: Dict[int, HandGeometry] = {}
         for hand, geo in zip(assigned, geometries):

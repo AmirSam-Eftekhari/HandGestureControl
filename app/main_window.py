@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from typing import List
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
@@ -28,7 +29,7 @@ from PySide6.QtWidgets import (
 
 from app.actions.action_registry import ActionContext
 from app.actions.system_actions import KeyboardAndMediaController, ScreenshotService, SystemVolumeController
-from app.camera.camera_manager import CameraManager, CapturedFrame, enumerate_cameras
+from app.camera.camera_manager import CameraDeviceInfo, CameraManager, CapturedFrame, enumerate_cameras_async
 from app.config.schema import AppConfig
 from app.config.settings import get_config_dir, load_config, save_config
 from app.config.defaults import DEFAULT_MAPPINGS
@@ -43,6 +44,8 @@ from app.ui.widgets.hand_status_panel import HandStatusPanel
 from app.ui.widgets.status_bar_widget import StatusBarWidget
 from app.ui.widgets.toast import ToastOverlay
 from app.ui.widgets.toggle_switch import ToggleSwitch
+from app.utils.background_executor import BackgroundExecutor
+from app.utils.gui_invoker import GuiInvoker
 
 logger = logging.getLogger(__name__)
 
@@ -62,15 +65,33 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Hand Gesture Control")
         self.resize(1360, 860)
+        # A hard floor on window size, not just a suggested default --
+        # below this, no combination of layout policy can keep every
+        # label readable (the settings/mapping panels alone need room
+        # for their longest labels). Better to stop the window from
+        # shrinking further than to let text start clipping silently.
+        self.setMinimumSize(1200, 700)
         self.setStyleSheet(build_stylesheet())
 
         self.config: AppConfig = load_config()
         self._tracking_paused = False
         self._last_annotated_frame = None
+        self._latest_pipeline_result = None
+
+        # Constructed here (on the GUI thread, since __init__ always runs
+        # on whichever thread creates this QObject) so both are correctly
+        # GUI-thread-affine before anything can call into them.
+        self._gui_invoker = GuiInvoker(self)
+        self._bg_executor = BackgroundExecutor(name="system-actions")
 
         self._build_action_context()
         self._build_ui()
         self._wire_camera_and_pipeline()
+
+        self._status_refresh_timer = QTimer(self)
+        self._status_refresh_timer.setInterval(100)  # 10Hz -- see _refresh_status_ui
+        self._status_refresh_timer.timeout.connect(self._refresh_status_ui)
+        self._status_refresh_timer.start()
 
         QTimer.singleShot(0, self._start_everything)
 
@@ -82,21 +103,39 @@ class MainWindow(QMainWindow):
         screenshots_dir = get_config_dir() / "screenshots"
         self._screenshot_service = ScreenshotService(screenshots_dir)
 
+        # IMPORTANT: these callbacks are invoked by ActionDispatcher from
+        # inside PipelineWorker._process() -- i.e. on the pipeline's
+        # worker thread, never the GUI thread. Any callback that touches
+        # a QWidget MUST be marshaled onto the GUI thread via
+        # self._gui_invoker rather than called directly; calling QWidget
+        # methods from a worker thread is exactly what previously caused
+        # "QObject::setParent: Cannot set parent, new parent is in a
+        # different thread" and is a genuine crash risk, not just a
+        # cosmetic warning. Callbacks that only do blocking system I/O
+        # (subprocess calls, simulated key events) are routed through
+        # self._bg_executor instead, so they block neither the GUI thread
+        # nor the realtime pipeline thread.
         self.action_context = ActionContext(
-            toggle_mirror=self._toggle_mirror,
-            toggle_skeleton=self._toggle_skeleton,
-            toggle_landmarks=self._toggle_landmarks,
-            pause_resume_tracking=self._toggle_pause,
-            take_screenshot=self._take_screenshot,
-            switch_camera=self._switch_camera,
-            start_stop_recording=lambda: self._toast("Recording is not implemented in this build.", "warning"),
-            system_volume_step=lambda direction: self._volume_controller.step_volume(direction),
-            system_volume_set=lambda percent: self._volume_controller.set_volume_percent(percent),
-            system_mute_toggle=self._volume_controller.toggle_mute,
-            media_previous=self._keyboard_media.media_previous,
-            media_next=self._keyboard_media.media_next,
-            media_play_pause=self._keyboard_media.media_play_pause,
-            notify=lambda msg: self._toast(msg, "info"),
+            toggle_mirror=lambda: self._gui_invoker.call(self._toggle_mirror),
+            toggle_skeleton=lambda: self._gui_invoker.call(self._toggle_skeleton),
+            toggle_landmarks=lambda: self._gui_invoker.call(self._toggle_landmarks),
+            pause_resume_tracking=lambda: self._gui_invoker.call(self._toggle_pause),
+            take_screenshot=lambda: self._gui_invoker.call(self._take_screenshot),
+            switch_camera=lambda: self._gui_invoker.call(self._switch_camera),
+            start_stop_recording=lambda: self._gui_invoker.call(
+                self._toast, "Recording is not implemented in this build.", "warning"
+            ),
+            system_volume_step=lambda direction: self._bg_executor.submit(
+                lambda: self._volume_controller.step_volume(direction)
+            ),
+            system_volume_set=lambda percent: self._bg_executor.submit(
+                lambda: self._volume_controller.set_volume_percent(percent)
+            ),
+            system_mute_toggle=lambda: self._bg_executor.submit(self._volume_controller.toggle_mute),
+            media_previous=lambda: self._bg_executor.submit(self._keyboard_media.media_previous),
+            media_next=lambda: self._bg_executor.submit(self._keyboard_media.media_next),
+            media_play_pause=lambda: self._bg_executor.submit(self._keyboard_media.media_play_pause),
+            notify=lambda msg: self._gui_invoker.call(self._toast, msg, "info"),
         )
 
     # -- UI construction ----------------------------------------------------
@@ -133,7 +172,7 @@ class MainWindow(QMainWindow):
 
         # --- Right: hand status + tabs (mapping/settings/history) ---
         right_container = QWidget()
-        right_container.setFixedWidth(360)
+        right_container.setMinimumWidth(520)
         right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(10)
@@ -142,12 +181,14 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.hand_status_panel)
 
         self.right_tabs = QTabWidget()
+        self.right_tabs.setUsesScrollButtons(True)
+        self.right_tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
         self.gesture_mapping_panel = GestureMappingPanel(self.config.gestures.mappings)
         self.gesture_mapping_panel.mappings_changed.connect(self._on_settings_edited)
         self.gesture_mapping_panel.restore_defaults_requested.connect(self._restore_default_mappings)
         self.right_tabs.addTab(self.gesture_mapping_panel, "Mapping")
 
-        self.settings_panel = SettingsPanel(self.config, enumerate_cameras())
+        self.settings_panel = SettingsPanel(self.config, [])
         self.settings_panel.settings_changed.connect(self._on_settings_edited)
         self.settings_panel.restore_defaults_requested.connect(self._restore_default_settings)
         self.right_tabs.addTab(self.settings_panel, "Settings")
@@ -225,6 +266,7 @@ class MainWindow(QMainWindow):
         self.camera_manager.connected.connect(self._on_camera_connected)
         self.camera_manager.disconnected.connect(self._on_camera_disconnected)
         self.camera_manager.error_occurred.connect(self._on_camera_error)
+        self.camera_manager.reconnecting.connect(self._on_camera_reconnecting)
 
         self.pipeline = FramePipeline(self.config, self.action_context)
         self.pipeline.result_ready.connect(self._on_pipeline_result)
@@ -233,10 +275,49 @@ class MainWindow(QMainWindow):
 
     def _start_everything(self) -> None:
         self.pipeline.start()
-        cam = self.config.camera
-        self.camera_manager.start(cam.device_index, cam.requested_width, cam.requested_height, cam.requested_fps, cam.mirror)
         if self.config.pinch_volume.enabled_by_default:
             self.pipeline.pinch_volume_controller().enable()
+
+        # Camera enumeration is a blocking, potentially slow operation
+        # (each probed index can take tens to hundreds of ms) -- it must
+        # never run on the GUI thread. Enumerate in the background, then
+        # validate the configured device index against what's actually
+        # available and start the camera once we know it's a real index,
+        # falling back (with a clear, one-time notification) if not.
+        self.camera_view.set_placeholder("Looking for a camera...")
+        enumerate_cameras_async(lambda devices: self._gui_invoker.call(self._on_initial_enumeration_done, devices))
+
+    def _on_initial_enumeration_done(self, devices: List[CameraDeviceInfo]) -> None:
+        self.settings_panel.update_camera_devices(devices)
+
+        if not devices:
+            self.camera_view.set_placeholder(
+                "No camera was found. Connect a camera and choose Settings \u2192 Camera to try again.", kind="empty"
+            )
+            self._toast("No camera detected.", "warning", duration_ms=4000)
+            return
+
+        available_indices = {d.index for d in devices}
+        if self.config.camera.device_index not in available_indices:
+            fallback_index = min(available_indices)
+            logger.warning(
+                "Configured camera index %d is not available; falling back to camera %d.",
+                self.config.camera.device_index,
+                fallback_index,
+            )
+            self._toast(
+                f"Camera {self.config.camera.device_index} isn't available \u2014 using camera {fallback_index} instead.",
+                "warning",
+                duration_ms=4000,
+            )
+            self.config.camera.device_index = fallback_index
+            self._persist_config()
+
+        self._start_camera()
+
+    def _start_camera(self) -> None:
+        cam = self.config.camera
+        self.camera_manager.start(cam.device_index, cam.requested_width, cam.requested_height, cam.requested_fps, cam.mirror)
 
     def _on_frame_ready(self, captured: CapturedFrame) -> None:
         self.pipeline.submit_frame(captured)
@@ -247,7 +328,10 @@ class MainWindow(QMainWindow):
 
     def _on_camera_disconnected(self) -> None:
         self.camera_view.set_camera_active(False)
-        self.camera_view.set_placeholder("Camera disconnected. Reconnecting...")
+        self.camera_view.set_placeholder("Camera disconnected. Reconnecting...", kind="reconnecting")
+
+    def _on_camera_reconnecting(self, delay_seconds: float) -> None:
+        self.camera_view.set_placeholder(f"Camera unavailable \u2014 retrying in {delay_seconds:.0f}s...", kind="reconnecting")
 
     def _on_camera_error(self, message: str, detail: str) -> None:
         logger.error("Camera error: %s (%s)", message, detail)
@@ -264,8 +348,24 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Hand Detection Problem", message)
 
     def _on_pipeline_result(self, result: PipelineResult) -> None:
+        # The video frame itself updates every frame -- that's the whole
+        # point. Status-bar text (FPS/latency/gesture label) and the hand
+        # glyph panel are throttled to a lower rate (see
+        # `_refresh_status_ui` / `_status_refresh_timer`): a human can't
+        # perceive a number changing 60 times a second, and re-laying-out
+        # QLabel text that often is needless UI work on the GUI thread.
         self._last_annotated_frame = result.annotated_frame
         self.camera_view.update_frame(result.annotated_frame)
+        self._latest_pipeline_result = result
+
+        for event in result.events:
+            self.gesture_history.add_event(event)
+            self._toast(f"{event.gesture_id.replace('_', ' ').title()} ({event.handedness})", "info", duration_ms=1400)
+
+    def _refresh_status_ui(self) -> None:
+        result = self._latest_pipeline_result
+        if result is None:
+            return
 
         states_by_hand = {hd.hand.handedness: hd.finger_states for hd in result.hands}
         self.hand_status_panel.update_hands(states_by_hand)
@@ -280,10 +380,6 @@ class MainWindow(QMainWindow):
             if hd.static_label:
                 top_label, top_conf = hd.static_label, 1.0
         self.status_bar_widget.show_gesture(top_label, top_conf)
-
-        for event in result.events:
-            self.gesture_history.add_event(event)
-            self._toast(f"{event.gesture_id.replace('_', ' ').title()} ({event.handedness})", "info", duration_ms=1400)
 
     # -- action context callbacks --------------------------------------------
 
@@ -326,7 +422,11 @@ class MainWindow(QMainWindow):
             self._toast("Couldn't save the snapshot.", "danger")
 
     def _switch_camera(self) -> None:
-        devices = enumerate_cameras()
+        self._toast("Looking for cameras...", "info", duration_ms=1200)
+        enumerate_cameras_async(lambda devices: self._gui_invoker.call(self._on_switch_camera_enumeration_done, devices))
+
+    def _on_switch_camera_enumeration_done(self, devices: List[CameraDeviceInfo]) -> None:
+        self.settings_panel.update_camera_devices(devices)
         if len(devices) < 2:
             self._toast("Only one camera detected.", "warning")
             return
@@ -398,9 +498,22 @@ class MainWindow(QMainWindow):
             self.toast_overlay.setGeometry(self.centralWidget().rect())
 
     def closeEvent(self, event) -> None:
+        logger.info("Shutting down...")
+        try:
+            self._status_refresh_timer.stop()
+        except Exception:
+            logger.exception("Error stopping status refresh timer")
         try:
             self.pipeline.stop()
+        except Exception:
+            logger.exception("Error stopping pipeline")
+        try:
             self.camera_manager.stop()
         except Exception:
-            logger.exception("Error during shutdown")
+            logger.exception("Error stopping camera manager")
+        try:
+            self._bg_executor.stop()
+        except Exception:
+            logger.exception("Error stopping background executor")
+        logger.info("Shutdown complete.")
         super().closeEvent(event)

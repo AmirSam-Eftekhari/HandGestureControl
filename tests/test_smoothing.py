@@ -64,9 +64,11 @@ def test_smoother_prunes_stale_hand_state():
     smoother = HandLandmarkSmoother(cfg)
     hand = open_palm(hand_id=1)
     smoother.smooth(hand, t_seconds=0.0)
-    assert 1 in smoother._banks
+    assert 1 in smoother._image_banks
+    assert 1 in smoother._world_banks
     smoother.prune_stale(active_hand_ids=set())
-    assert 1 not in smoother._banks
+    assert 1 not in smoother._image_banks
+    assert 1 not in smoother._world_banks
 
 
 def test_disabled_smoothing_passes_through_unchanged():
@@ -76,3 +78,52 @@ def test_disabled_smoothing_passes_through_unchanged():
     x_before = hand.landmarks[0].x
     result = smoother.smooth(hand, t_seconds=0.0)
     assert result.landmarks[0].x == x_before
+
+
+def test_smoother_also_filters_world_landmarks():
+    """Regression test: an earlier version only smoothed the normalized
+    image-space landmarks, leaving world_landmarks (which geometry.py
+    prefers whenever a backend provides them, e.g. real MediaPipe)
+    completely unsmoothed -- meaning temporal smoothing had no effect at
+    all on finger-state/gesture recognition against real camera input."""
+    cfg = SmoothingConfig(enabled=True, method="one_euro")
+    smoother = HandLandmarkSmoother(cfg)
+    hand = open_palm(hand_id=3)
+    original_world_x = hand.world_landmarks[0].x
+
+    # Nudge the raw world landmark noticeably between frames so a
+    # smoothing filter has something to visibly lag behind if it's
+    # actually running.
+    for i in range(5):
+        hand.world_landmarks[0].x = original_world_x + (0.05 if i % 2 == 0 else -0.05)
+        hand = smoother.smooth(hand, t_seconds=i * 0.033)
+
+    assert 3 in smoother._world_banks
+    # A One Euro filter smoothing an oscillating raw signal should not
+    # reproduce the full amplitude of the last raw jump exactly -- if it
+    # did, nothing was actually filtered.
+    last_raw = original_world_x + (0.05 if 4 % 2 == 0 else -0.05)
+    assert hand.world_landmarks[0].x != last_raw
+
+
+def test_smoother_recovers_from_non_finite_filter_output():
+    """A filter must never be allowed to poison every subsequent frame
+    with NaN once it starts producing one -- it should reset and fall
+    back to the raw value instead."""
+    cfg = SmoothingConfig(enabled=True, method="one_euro")
+    smoother = HandLandmarkSmoother(cfg)
+    hand = open_palm(hand_id=4)
+
+    # Feed a legitimate first frame, then corrupt a filter's internal
+    # state directly to simulate an otherwise-impossible-to-reach
+    # non-finite condition, and confirm the next frame recovers cleanly
+    # rather than propagating NaN forward.
+    hand = smoother.smooth(hand, t_seconds=0.0)
+    bank = smoother._image_banks[4]
+    bank[0][0]._x_prev = float("nan")  # corrupt the wrist x-filter's state
+
+    hand.landmarks[0].x = 0.42
+    hand = smoother.smooth(hand, t_seconds=0.033)
+
+    assert hand.landmarks[0].x == hand.landmarks[0].x  # not NaN
+    assert hand.landmarks[0].x not in (float("inf"), float("-inf"))

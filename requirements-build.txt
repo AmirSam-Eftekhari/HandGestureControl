@@ -1,0 +1,4 @@
+# Only needed to build the Windows distribution (build_windows.bat).
+# Not required to run the app from source -- see requirements.txt for that.
+pyinstaller>=6.10
+Pillow>=10.0

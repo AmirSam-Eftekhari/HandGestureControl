@@ -44,6 +44,7 @@ class CameraView(QWidget):
         self._camera_active = False
         self._mock_backend = False
         self._placeholder_text = "Waiting for camera..."
+        self._placeholder_kind = "loading"
 
     def set_camera_active(self, active: bool) -> None:
         self._camera_active = active
@@ -53,14 +54,48 @@ class CameraView(QWidget):
         self._mock_backend = is_mock
         self._image_label.update()
 
-    def set_placeholder(self, text: str) -> None:
+    def set_placeholder(self, text: str, kind: str = "loading") -> None:
+        """kind: 'loading' | 'reconnecting' | 'error' | 'empty'. Renders a
+        small centered icon + message rather than bare text on a black
+        rectangle, so "no camera yet" and "camera failed" read as
+        intentional, designed states instead of a broken widget."""
         self._placeholder_text = text
+        self._placeholder_kind = kind
         self._last_pixmap = None
-        self._image_label.setText(text)
-        self._image_label.setStyleSheet(
-            f"background-color: #000000; color: {Tokens.text_secondary}; "
-            f"border-radius: {Tokens.radius_lg}px; font-size: {Tokens.size_md}px;"
+        self._render_placeholder()
+
+    def _render_placeholder(self) -> None:
+        size = self._image_label.size()
+        if size.width() < 10 or size.height() < 10:
+            return
+        pixmap = QPixmap(size)
+        pixmap.fill(QColor(Tokens.bg_base if self._placeholder_kind != "error" else "#1a1214"))
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        icon_name = {"loading": "camera", "reconnecting": "camera_switch", "error": "warning", "empty": "camera"}.get(
+            self._placeholder_kind, "camera"
         )
+        icon_color = Tokens.danger if self._placeholder_kind == "error" else Tokens.text_secondary
+        icon_size = 40
+        icon_pixmap = icon(icon_name, color=icon_color, size=icon_size).pixmap(icon_size, icon_size)
+
+        cx = size.width() // 2
+        cy = size.height() // 2
+        painter.setOpacity(0.85)
+        painter.drawPixmap(cx - icon_size // 2, cy - icon_size - 6, icon_pixmap)
+        painter.setOpacity(1.0)
+
+        painter.setPen(QColor(Tokens.text_secondary if self._placeholder_kind != "error" else Tokens.danger))
+        font = painter.font()
+        font.setPointSize(11)
+        painter.setFont(font)
+        text_rect = pixmap.rect().adjusted(24, cy + 6, -24, 0)
+        painter.drawText(text_rect, Qt.AlignHCenter | Qt.TextWordWrap, self._placeholder_text)
+        painter.end()
+
+        self._image_label.setPixmap(pixmap)
 
     def update_frame(self, bgr_frame: np.ndarray) -> None:
         qimage = bgr_to_qimage(bgr_frame)
@@ -69,7 +104,10 @@ class CameraView(QWidget):
         self._render_scaled()
 
     def resizeEvent(self, event) -> None:
-        self._render_scaled()
+        if self._last_pixmap is None:
+            self._render_placeholder()
+        else:
+            self._render_scaled()
         super().resizeEvent(event)
 
     def _render_scaled(self) -> None:

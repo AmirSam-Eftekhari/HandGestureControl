@@ -11,3 +11,12 @@ assets/models/*.task
 # Local run artifacts
 *.log
 .DS_Store
+
+# Build artifacts
+.venv-build/
+build/
+dist/
+release/
+*.spec.bak
+warn-*.txt
+xref-*.html

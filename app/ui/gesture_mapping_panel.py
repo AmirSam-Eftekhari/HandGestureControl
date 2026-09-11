@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import List
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -32,6 +33,12 @@ from app.config.defaults import ACTION_LABELS, GESTURE_LABELS
 from app.config.schema import ActionMappingEntry
 
 _COLUMNS = ("Enabled", "Gesture", "Action", "Cooldown (ms)")
+
+# Extra room around the widest label's raw text width, to cover the
+# combo box's dropdown arrow, internal padding, and border -- without
+# this, a combo sized to the *exact* text width still clips by a few
+# pixels the moment Qt adds its own chrome around it.
+_COMBO_PADDING_PX = 44
 
 
 class GestureMappingPanel(QWidget):
@@ -69,11 +76,37 @@ class GestureMappingPanel(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionMode(QAbstractItemView.NoSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        # Every column sized to fit its own actual content -- never
+        # "Stretch", which is what was squeezing the Action combo boxes
+        # down to a sliver and forcing Qt to elide their text ("Cont...",
+        # "Take...", "Pause...") regardless of how much text there
+        # actually was to show. A table wider than its container scrolls
+        # horizontally (see setHorizontalScrollBarPolicy below) rather
+        # than truncating anything -- the full text is always reachable,
+        # never hidden behind "...".
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.table.setWordWrap(True)
+        self.table.verticalHeader().setDefaultSectionSize(34)
         layout.addWidget(self.table)
 
+        self._action_combo_width = self._compute_action_combo_width()
         self._rebuild_rows()
+
+    def _compute_action_combo_width(self) -> int:
+        """Every action combo offers the same fixed set of items (all of
+        ACTION_LABELS), so one font-metrics measurement of the single
+        widest label -- not Qt's own per-instance size hinting, which
+        has historically been inconsistent about whether it considers
+        every item or just the current one -- gives a width guaranteed
+        to fit any selection in any row."""
+        metrics = QFontMetrics(self.font())
+        widest_text_px = max(metrics.horizontalAdvance(label) for label in ACTION_LABELS.values())
+        return widest_text_px + _COMBO_PADDING_PX
 
     def set_mappings(self, mappings: List[ActionMappingEntry]) -> None:
         self.mappings = mappings
@@ -105,6 +138,7 @@ class GestureMappingPanel(QWidget):
         current_index = action_combo.findData(mapping.action_id)
         if current_index >= 0:
             action_combo.setCurrentIndex(current_index)
+        action_combo.setMinimumWidth(self._action_combo_width)
         action_combo.currentIndexChanged.connect(
             lambda idx, m=mapping, combo=action_combo: self._on_action_changed(m, combo.itemData(idx))
         )

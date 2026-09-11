@@ -195,7 +195,7 @@ def config_from_dict(data: Dict[str, Any]) -> AppConfig:
     pinch_volume = PinchVolumeConfig(**{**config_to_dict(PinchVolumeConfig()), **data.get("pinch_volume", {})})
     theme = data.get("theme", "dark")
 
-    return AppConfig(
+    cfg = AppConfig(
         camera=camera,
         detection=detection,
         smoothing=smoothing,
@@ -205,3 +205,107 @@ def config_from_dict(data: Dict[str, Any]) -> AppConfig:
         pinch_volume=pinch_volume,
         theme=theme,
     )
+    return validate_and_clamp(cfg)
+
+
+def _clamp(value, low, high, default):
+    """Clamps a number into [low, high]; falls back to `default` for
+    anything that isn't even a usable number (wrong type, NaN, etc) --
+    a hand-edited or corrupted config file can contain arbitrary JSON
+    values in a numeric field, and this must never raise."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    if value != value:  # NaN check without importing math for one use
+        return default
+    return max(low, min(high, value))
+
+
+def validate_and_clamp(cfg: AppConfig) -> AppConfig:
+    """Defends against invalid configuration states -- out-of-range
+    thresholds, non-positive sizes, inverted min/max pairs, unknown
+    enum-like strings -- regardless of whether they came from a
+    corrupted file, a value from an older/newer app version, or a
+    hand-edited settings.json. This runs on every config load (and on
+    fresh defaults, as a cheap self-check) so the rest of the app can
+    trust these values are always sane without re-validating them
+    itself. Never raises; anything it can't make sense of is replaced
+    with a safe default rather than rejected wholesale, so one bad field
+    doesn't cost the user their whole settings file.
+    """
+    c = cfg.camera
+    c.device_index = int(_clamp(c.device_index, 0, 64, 0))
+    c.requested_width = int(_clamp(c.requested_width, 160, 7680, 1280))
+    c.requested_height = int(_clamp(c.requested_height, 120, 4320, 720))
+    c.requested_fps = int(_clamp(c.requested_fps, 1, 240, 30))
+
+    d = cfg.detection
+    d.max_hands = int(_clamp(d.max_hands, 1, 2, 2))
+    d.detection_confidence = _clamp(d.detection_confidence, 0.05, 0.99, 0.6)
+    d.presence_confidence = _clamp(d.presence_confidence, 0.05, 0.99, 0.5)
+    d.tracking_confidence = _clamp(d.tracking_confidence, 0.05, 0.99, 0.5)
+    d.max_missed_frames = int(_clamp(d.max_missed_frames, 1, 300, 8))
+    if not isinstance(d.model_path, str) or not d.model_path.strip():
+        d.model_path = DetectionConfig().model_path
+    if not isinstance(d.backend, str) or not d.backend.strip():
+        d.backend = DetectionConfig().backend
+
+    s = cfg.smoothing
+    if s.method not in ("one_euro", "ema"):
+        s.method = "one_euro"
+    s.one_euro_min_cutoff = _clamp(s.one_euro_min_cutoff, 0.01, 50.0, 1.2)
+    s.one_euro_beta = _clamp(s.one_euro_beta, 0.0, 200.0, 12.0)
+    s.one_euro_d_cutoff = _clamp(s.one_euro_d_cutoff, 0.01, 50.0, 1.0)
+    s.ema_alpha = _clamp(s.ema_alpha, 0.01, 1.0, 0.5)
+
+    t = cfg.gestures.thresholds
+    t.curl_extended_max = _clamp(t.curl_extended_max, 0.01, 0.95, 0.35)
+    t.curl_folded_min = _clamp(t.curl_folded_min, 0.05, 0.99, 0.65)
+    if t.curl_extended_max >= t.curl_folded_min:
+        # An inverted or overlapping pair can't be interpreted sensibly
+        # -- reset both to the factory defaults rather than guess at a
+        # "fixed" pair that might not reflect what the user intended.
+        t.curl_extended_max, t.curl_folded_min = 0.35, 0.65
+    t.thumb_extended_angle_deg = _clamp(t.thumb_extended_angle_deg, 1.0, 89.0, 35.0)
+    t.static_confirm_ms = _clamp(t.static_confirm_ms, 0.0, 5000.0, 120.0)
+    t.static_min_confidence = _clamp(t.static_min_confidence, 0.01, 0.99, 0.55)
+    t.pinch_on_ratio = _clamp(t.pinch_on_ratio, 0.02, 0.95, 0.32)
+    t.pinch_off_ratio = _clamp(t.pinch_off_ratio, t.pinch_on_ratio, 1.0, max(0.42, t.pinch_on_ratio + 0.05))
+    t.swipe_min_speed = _clamp(t.swipe_min_speed, 0.05, 50.0, 1.8)
+    t.swipe_min_travel = _clamp(t.swipe_min_travel, 0.01, 2.0, 0.18)
+    t.swipe_max_duration_ms = _clamp(t.swipe_max_duration_ms, 50.0, 5000.0, 550.0)
+    t.wave_min_direction_changes = int(_clamp(t.wave_min_direction_changes, 1, 20, 3))
+    t.wave_window_ms = _clamp(t.wave_window_ms, 100.0, 10000.0, 1200.0)
+    t.circle_min_radius = _clamp(t.circle_min_radius, 0.005, 2.0, 0.05)
+    t.circle_min_coverage = _clamp(t.circle_min_coverage, 0.1, 1.0, 0.7)
+    t.snap_velocity_threshold = _clamp(t.snap_velocity_threshold, 0.1, 100.0, 6.5)
+    t.snap_min_pre_distance = _clamp(t.snap_min_pre_distance, 0.01, 2.0, 0.12)
+    t.snap_max_trigger_distance = _clamp(t.snap_max_trigger_distance, 0.001, t.snap_min_pre_distance, min(0.06, t.snap_min_pre_distance))
+    t.snap_window_ms = _clamp(t.snap_window_ms, 20.0, 5000.0, 180.0)
+    t.snap_cooldown_ms = _clamp(t.snap_cooldown_ms, 0.0, 10000.0, 450.0)
+    t.default_action_cooldown_ms = _clamp(t.default_action_cooldown_ms, 0.0, 10000.0, 400.0)
+
+    for mapping in cfg.gestures.mappings:
+        mapping.cooldown_ms = _clamp(mapping.cooldown_ms, 0.0, 20000.0, 400.0)
+        mapping.sensitivity = _clamp(mapping.sensitivity, 0.01, 10.0, 1.0)
+        mapping.enabled = bool(mapping.enabled)
+
+    v = cfg.visualization
+    if v.mode not in ("minimal", "skeleton", "detailed", "debug"):
+        v.mode = "skeleton"
+    v.trail_length = int(_clamp(v.trail_length, 2, 200, 18))
+
+    p = cfg.performance
+    p.target_processing_fps = int(_clamp(p.target_processing_fps, 1, 240, 30))
+
+    pv = cfg.pinch_volume
+    pv.min_distance_ratio = _clamp(pv.min_distance_ratio, 0.0, 5.0, 0.08)
+    pv.max_distance_ratio = _clamp(pv.max_distance_ratio, pv.min_distance_ratio + 0.01, 10.0, max(0.55, pv.min_distance_ratio + 0.1))
+    pv.smoothing_alpha = _clamp(pv.smoothing_alpha, 0.01, 1.0, 0.25)
+    pv.dead_zone_percent = _clamp(pv.dead_zone_percent, 0.0, 50.0, 1.5)
+
+    if cfg.theme not in ("dark", "light"):
+        cfg.theme = "dark"
+
+    return cfg

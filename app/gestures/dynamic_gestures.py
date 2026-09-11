@@ -47,7 +47,7 @@ def detect_swipe(track: TrackedHand, thresholds: GestureThresholds) -> Optional[
     else:
         return None
 
-    confidence = min(1.0, distance / (thresholds.swipe_min_travel * 2.0))
+    confidence = min(1.0, distance / max(thresholds.swipe_min_travel * 2.0, 1e-6))
     return DynamicGestureMatch(gesture_id, confidence)
 
 
@@ -83,7 +83,7 @@ def detect_wave(track: TrackedHand, thresholds: GestureThresholds) -> Optional[D
         total_travel += abs(v)
 
     if direction_changes >= thresholds.wave_min_direction_changes and total_travel > 0.3:
-        confidence = min(1.0, direction_changes / (thresholds.wave_min_direction_changes * 1.5))
+        confidence = min(1.0, direction_changes / max(thresholds.wave_min_direction_changes * 1.5, 1e-6))
         return DynamicGestureMatch("wave", confidence)
     return None
 
