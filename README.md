@@ -1,11 +1,11 @@
 # Hand Gesture Control
 
 A real-time hand tracking and gesture control desktop application: two
-hands, 21 landmarks each, robust finger-state analysis, static and
-dynamic gesture recognition, a continuous pinch-to-volume mode, and a
-fully configurable gesture-to-action mapping system — all running
-locally, with a custom-designed PySide6 interface and a packaged Windows
-build that needs no Python installation to run.
+hands, 21 landmarks each, robust finger-state analysis, static gesture
+recognition (built-in and your own recorded gestures), a continuous
+pinch-to-volume mode, and a fully configurable gesture-to-action mapping
+system — all running locally, with a custom-designed PySide6 interface
+and a packaged Windows build that needs no Python installation to run.
 
 ![status](https://img.shields.io/badge/status-active-brightgreen)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -26,9 +26,11 @@ mutex-guarded handoff, never a direct cross-thread call); and a
 hand-built design system instead of default Qt widgets.
 
 It's built to be **extended**, not just run: swap in a different
-detector backend, add a new static or dynamic gesture, wire a gesture to
+detector backend, add a new built-in static gesture, wire a gesture to
 a new system action, or add a new visualization mode — each of those is
-a localized change, not a rewrite.
+a localized change, not a rewrite. (Adding a gesture *without* touching
+code at all is a built-in feature now too — see "Recording your own
+gesture" below.)
 
 ## Key features
 
@@ -43,9 +45,10 @@ a localized change, not a rewrite.
   OK, pinch, three-finger, four-finger — each temporally confirmed
   (must hold for a configurable duration) and edge-triggered (fires once
   per pose, not every frame it's held).
-- **Dynamic gestures**: swipe (4 directions), hand wave, and circular
-  motion, all detected from a rolling window of hand-center motion, not
-  a single frame.
+- **Record your own gestures**: hold a pose, capture it, name it, assign
+  it any action. Matching is hand- and mirror-agnostic by construction
+  (see "Recording your own gesture" below) — record with either hand,
+  recognized with both.
 - **Finger-snap detection** using closing velocity + a temporal window +
   cooldown, distinguishing an intentional snap from fingers merely
   resting close together.
@@ -81,8 +84,8 @@ a localized change, not a rewrite.
 | Type    | Gesture                                   |
 |---------|--------------------------------------------|
 | Static  | Open palm, fist, pointing, thumb up, thumb down, peace/V, OK, pinch, three fingers, four fingers |
-| Dynamic | Swipe left/right/up/down, hand wave, circular motion |
 | Special | Finger snap, pinch-and-hold (continuous volume control) |
+| Custom  | Whatever you record yourself — see below |
 
 Default gesture → action mappings (edit anytime in **Mapping**):
 
@@ -92,10 +95,49 @@ Default gesture → action mappings (edit anytime in **Mapping**):
 | Snap        | Take camera snapshot             | ✅ |
 | Open palm   | Pause / resume tracking          | ✅ |
 | Fist        | Cancel current mode               | off |
-| Swipe left/right | Media previous/next         | off |
-| Swipe up/down    | Volume step up/down          | off |
+| Thumb up / down | Confirm / Cancel (log only)  | off |
 | Peace       | Toggle skeleton overlay           | off |
-| Wave        | Toggle mirror mode                | off |
+
+Earlier versions also shipped built-in dynamic (motion) gestures --
+swipe, wave, circular motion. They were removed rather than kept
+alongside custom gestures: this app's custom-gesture system is
+pose-based (see below), so a fixed built-in *motion* gesture the user
+couldn't redefine the same way everything else now can be didn't earn
+its place. If you want a swipe-like trigger, the practical equivalent
+today is recording a distinct pose (e.g. an open hand held sideways) as
+a custom gesture.
+
+### Recording your own gesture
+
+**Mapping → Record New Gesture** opens a small recorder: hold a pose in
+front of the camera, click **Capture** (it samples for ~0.7s and
+averages the readings, which is more robust than trusting a single
+frame), name it, and assign one of the existing actions to it — media
+controls, volume step, mute, screenshot, mirror/skeleton toggles,
+keyboard shortcuts, anything in the Action dropdown except continuous
+volume control (that one's pinch-only, since it needs a continuously
+*varying* distance, not a fixed pose). The new gesture shows up in the
+mapping table immediately, right alongside the built-in ones, and can be
+enabled/disabled, re-cooled-down, or deleted the same way.
+
+Recording is deliberately **pose-based, not motion-based** — a template
+is a snapshot of finger curl and thumb geometry, not a recorded
+trajectory. This is what makes matching simple, fast, and (per the
+project's testing philosophy) verifiable with synthetic data instead of
+needing trajectory-matching (DTW-style) machinery that would be a
+meaningfully bigger, riskier thing to get right.
+
+**Works with either hand, regardless of which one you recorded with, and
+regardless of Camera Mirror Mode.** This isn't a claim to just take on
+faith — it follows from *what* gets stored: a template holds finger curl
+ratios, a thumb angle, and a normalized pinch distance, never raw x/y
+position. A folded finger produces the same curl value whether it's the
+left or right hand, and mirroring changes *where* a hand appears on
+screen, not *how folded its fingers are*. See
+`app/gestures/custom_gestures.py` for the full reasoning, including why
+this project deliberately avoids trying to "correct" handedness labels
+based on the mirror setting rather than sidestepping the question
+entirely.
 
 ## Architecture
 
@@ -110,7 +152,7 @@ Frame Pipeline (own thread)
         ├─ Landmark Smoother      (One Euro Filter, image- AND world-space, per hand)
         ├─ Geometry Engine        (palm scale/axes, finger straightness, angles)
         ├─ Finger-State Classifier
-        ├─ Gesture Engine         (static confirmation, dynamic detection, snap, cooldown)
+        ├─ Gesture Engine         (static + custom-gesture matching, confirmation, snap, cooldown)
         ├─ Action Dispatcher      (gesture → action mapping, its own cooldown)
         ├─ Pinch-Volume Controller (commits to the OS only when the value actually changes)
         └─ Overlay Renderer       (draws skeleton/labels/trail onto the frame)
@@ -127,7 +169,7 @@ app/
 ├── vision/                 # backend interface + MediaPipe/mock implementations,
 │                            #   landmark model, geometry, finger-state, smoothing, path resolution
 ├── tracking/                # multi-hand identity + motion history + NaN backstop
-├── gestures/                # static/dynamic classifiers, snap, pinch, gesture engine
+├── gestures/                # static + custom-gesture classifiers, snap, pinch, gesture engine
 ├── actions/                  # action registry, gesture→action mapping, system actions
 ├── pipeline/                 # the real-time frame-processing worker/thread
 ├── ui/                       # design system, widgets, camera view, settings, mapping screen
@@ -289,6 +331,24 @@ codebase:
   tracking with no visible error and no recovery. Fixed with per-hand
   and per-frame exception containment, rate-limited logging, and a
   degrade-to-"skip this frame" behavior throughout.
+- **Volume control did nothing on Windows** — the root cause was a
+  classic COM apartment-threading violation: the Windows audio endpoint
+  (a COM interface pointer, via `pycaw`) was activated once in
+  `SystemVolumeController.__init__()`, which runs on the GUI thread, and
+  cached. Actual volume calls run on `BackgroundExecutor`'s dedicated
+  worker thread (specifically so they never block the GUI or realtime
+  pipeline threads) — a *different* OS thread that never initialized COM
+  for itself. Calling a COM method with a pointer that belongs to a
+  different thread's apartment is undefined/silently-failing behavior on
+  Windows. Fixed so every thread that actually issues a volume command
+  activates and caches *its own* endpoint in thread-local storage, after
+  calling `CoInitialize()` on itself first — see
+  `app/actions/system_actions.py` for the full explanation. Also added:
+  the Pinch Volume toggle now tells you plainly (a toast, not silence) if
+  no working volume backend was found, and the Windows build now bundles
+  `pycaw`/`comtypes` explicitly rather than trusting PyInstaller's
+  default import analysis to catch a library that does some of its own
+  dynamic module setup.
 
 ## Installation
 
@@ -402,9 +462,13 @@ Every field is validated and clamped into a safe range at load time —
 see `app/config/schema.py: validate_and_clamp` — so a corrupted or
 hand-edited settings file can't destabilize the app; anything it can't
 make sense of falls back to a factory default rather than being
-rejected wholesale. Logs live alongside it, under `logs/app.log`
-(rotated, capped size). See `configs/README.md` for details and
-`app/config/schema.py` for every available field.
+rejected wholesale. Your recorded custom gestures live alongside it, in
+their own `custom_gestures.json` (kept separate from `settings.json`
+since they're closer to your own content than an app setting — see
+`app/config/custom_gestures_store.py`), with the same
+corrupted-entry-tolerant loading. Logs live alongside both, under
+`logs/app.log` (rotated, capped size). See `configs/README.md` for
+details and `app/config/schema.py` for every available setting field.
 
 ## Performance
 
@@ -422,6 +486,54 @@ itself still measures every frame; only the on-screen text updates are
 rate-limited, since redrawing a number 60 times a second is wasted GUI
 work a person can't perceive anyway.
 
+### Getting the best performance (and the best tracking accuracy)
+
+Roughly in order of how much difference each one tends to make:
+
+1. **Enable GPU acceleration** (Settings → Detection → GPU acceleration).
+   MediaPipe's GPU delegate is meaningfully faster than CPU when it's
+   available. If your machine doesn't support it, the app already falls
+   back to CPU automatically and won't keep retrying GPU init on every
+   restart of detection — you'll see this in the log
+   (`app.vision.mediapipe_backend`) rather than a repeated stall.
+2. **Use good, even lighting, and keep your hand a reasonable distance
+   from the camera** (roughly forearm's length). This is the single
+   biggest lever on actual detection *quality* — MediaPipe's hand model,
+   like most vision models, degrades under motion blur, backlighting, or
+   a hand that's too close/too far/too far to one side of the frame.
+   Fast hand motion is the other big source of missed detections; the
+   temporal smoothing (One Euro Filter) helps with jitter once a hand
+   *is* detected, but it can't invent a detection MediaPipe never made.
+3. **Lower the camera resolution** if you don't need 1080p (Settings →
+   Camera → Resolution). 1280x720 is a solid default; going to 1920x1080
+   increases per-frame detection cost for very little accuracy gain in
+   most setups, since MediaPipe internally works on a much smaller
+   crop anyway.
+4. **Set Max Hands to 1** (Settings → Detection) if you only ever use one
+   hand — detecting two hands costs meaningfully more than one, for a
+   feature you're not using.
+5. **Turn off Motion Trail** (Settings → Visualization) and use
+   **Skeleton** or **Minimal** visualization mode rather than **Detailed**
+   or **Debug** — these only affect rendering cost, not detection, but
+   rendering is still real per-frame work.
+6. **Close other applications using the camera.** Most webcam drivers
+   only support one consumer at a time cleanly; a second app holding the
+   camera open is a common cause of a camera that "won't connect" as
+   well as of degraded frame rate from whichever app got the connection.
+7. **Increase confirmation time slightly** (Settings → Gestures →
+   Confirmation time) if gestures fire when you didn't mean them to, or
+   decrease it if they feel sluggish to trigger — this is a genuine
+   responsiveness/reliability trade-off, not a performance one, but it's
+   the setting people reach for right after "performance" so it's worth
+   mentioning here.
+
+If you're still not getting the FPS you expect after the above, run
+`scripts/benchmark.py` with the real camera backend and check whether
+`detection latency` or `camera read latency`-adjacent frame time is the
+larger share — that tells you whether the bottleneck is MediaPipe itself
+or something upstream (a slow camera driver, a busy CPU core from another
+application, etc.) rather than guessing.
+
 ## Testing
 
 ```bash
@@ -429,25 +541,35 @@ pip install -r requirements.txt
 pytest
 ```
 
-99 tests, all exercising real logic — no camera, GPU, or downloaded
+125 tests, all exercising real logic — no camera, GPU, or downloaded
 model required. Split roughly into:
 
 - **Core vision/gesture logic** against procedurally-generated synthetic
   hand poses (`app/utils/synthetic_hand.py`): geometry math, finger-state
-  classification, every static and dynamic gesture, multi-hand tracking
+  classification, every static gesture, multi-hand tracking
   identity/occlusion handling, smoothing filter behavior, pinch-volume
   mapping, snap-detector temporal logic, the gesture engine's
   confirmation/debounce state machine, the action registry and mapping
   dispatcher, config load/save.
+- **Custom gestures** (`tests/test_custom_gestures.py`,
+  `tests/test_custom_gestures_store.py`): template building/averaging,
+  distance-based matching (including an explicit test that matching is
+  hand-agnostic — record with the left hand, recognize with the right),
+  built-in-gestures-take-priority ordering, full confirmation/cooldown
+  flow through the real `GestureEngine`, and persistence (round-trip,
+  corruption recovery, malformed-entry tolerance).
 - **Hardening regression tests** (`tests/test_hardening_regressions.py`):
   one test per bug found during the production-hardening pass —
   timestamp monotonicity under concurrent access, rate-limited error
   logging, bounded camera enumeration, resource path resolution in both
   normal and simulated-frozen mode, config validation/clamping against
   deliberately malformed input, the NaN/Inf backstop at the tracker
-  boundary, live-detection-reinit decision logic, and genuine
-  cross-thread dispatch verification for `GuiInvoker` (using a real
-  `QApplication` event loop, not just "didn't raise synchronously").
+  boundary, live-detection-reinit decision logic, genuine cross-thread
+  dispatch verification for `GuiInvoker` (using a real `QApplication`
+  event loop, not just "didn't raise synchronously"), and the Windows
+  volume-control per-thread COM activation fix (with `pycaw`/`comtypes`
+  mocked, since this sandbox isn't Windows — what's under test is
+  `SystemVolumeController`'s own thread-local caching logic).
 
 Qt tests run headless automatically (`tests/conftest.py` sets
 `QT_QPA_PLATFORM=offscreen`), so the suite doesn't need a display.
@@ -480,21 +602,28 @@ Documented honestly rather than hidden:
 - **No recording**: "Start/Stop Recording" is wired into the action
   registry and selectable in the mapping table, but its implementation
   is a stub (shows a toast saying so) rather than a working feature.
-- **No custom-gesture recording UI**: the gesture engine's temporal
-  window and event history are architected to support recording and
-  matching a custom motion sequence later, but that UI isn't built.
-- **Interaction zones, cursor control, air-click, and two-hand gestures**
-  (zoom/rotate/scale) are not implemented. The per-hand tracking, motion
-  history, and geometry this would build on all exist and are exercised
-  by other features already, so adding them is additive.
+- **Custom gestures are pose-based, not motion-based**: you can record
+  and recognize a held hand *shape*, not a *motion* (a wave, a swipe
+  trajectory). This is a deliberate scope decision — see "Recording your
+  own gesture" above — not a partially-built feature.
+- **Interaction zones, cursor control, and air-click** are not
+  implemented. The per-hand tracking, motion history, and geometry this
+  would build on all exist and are exercised by other features already,
+  so adding them is additive.
+- **Two-hand gestures** (zoom/rotate/scale using both hands together)
+  are not implemented; both hands are already tracked independently
+  (each with its own identity, gesture state, and custom-gesture
+  matching), so this would combine existing per-hand data rather than
+  needing new tracking infrastructure.
 - **Handedness misclassification causes identity churn, not
   corruption**: if the detector momentarily flips its Left/Right
   classification for the same physical hand, the tracker treats it as a
   new hand (fresh id, fresh gesture/smoothing state) rather than merging
   it into the existing track, since track matching requires handedness
-  to match. This never corrupts state across hands, but a rapidly
-  flickering classification (uncommon in practice) could prevent a
-  dynamic gesture from accumulating enough history to fire.
+  to match. This never corrupts gesture *recognition* (custom and
+  built-in pose matching are both hand-agnostic by construction — see
+  "Recording your own gesture" above), only the continuity of the
+  tracked identity itself, and only while the flicker is happening.
 - **Volume reading on Linux/macOS**: setting volume works via `pactl` /
   `amixer` / `osascript`; *reading back* the current volume reliably
   across every Linux audio setup is brittle enough that
@@ -506,7 +635,10 @@ Documented honestly rather than hidden:
   platform-specific dependency.
 - **Windows packaging is unverified on actual Windows** — see "Building
   the Windows application" above for exactly what has and hasn't been
-  tested.
+  tested. This includes the Windows volume-control fix itself: the
+  threading bug and its fix are understood and tested at the logic level
+  (`tests/test_hardening_regressions.py`), but real `pycaw`/COM behavior
+  on Windows hardware hasn't been observed directly.
 - **Distribution size**: the Windows build is a few hundred MB, mostly
   MediaPipe's and OpenCV's compiled native libraries — both are already
   used at their minimum reasonable footprint (PySide6's is trimmed to
@@ -515,8 +647,10 @@ Documented honestly rather than hidden:
 
 ## Roadmap
 
-- Custom gesture recording (record a short landmark sequence, match
-  similar sequences later) — architecture is in place, UI is not.
+- Motion-based custom gestures (recording a short trajectory, not just
+  a pose) — the pose-based version is built; this would be a genuinely
+  separate matching approach (trajectory/DTW-style), not an extension of
+  the current one.
 - Interaction zones and cursor/air-click control mode.
 - Two-hand gestures (pinch-zoom, rotate, scale).
 - A second detector backend (e.g. an ONNX-exported model) to exercise

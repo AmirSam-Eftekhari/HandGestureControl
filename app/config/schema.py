@@ -75,14 +75,9 @@ class GestureThresholds:
     pinch_on_ratio: float = 0.32      # distance / palm_size below => pinching
     pinch_off_ratio: float = 0.42     # hysteresis release threshold
 
-    # Dynamic gesture motion.
-    swipe_min_speed: float = 1.8      # normalized units / second
-    swipe_min_travel: float = 0.18    # normalized hand-center displacement
-    swipe_max_duration_ms: float = 550.0
-    wave_min_direction_changes: int = 3
-    wave_window_ms: float = 1200.0
-    circle_min_radius: float = 0.05
-    circle_min_coverage: float = 0.7  # fraction of a full revolution
+    # Custom (user-recorded) gesture matching -- see
+    # app/gestures/custom_gestures.py. Lower = stricter match required.
+    custom_gesture_match_threshold: float = 0.35
 
     # Snap detector.
     snap_velocity_threshold: float = 6.5   # normalized units/second, thumb-middle closing speed
@@ -272,13 +267,7 @@ def validate_and_clamp(cfg: AppConfig) -> AppConfig:
     t.static_min_confidence = _clamp(t.static_min_confidence, 0.01, 0.99, 0.55)
     t.pinch_on_ratio = _clamp(t.pinch_on_ratio, 0.02, 0.95, 0.32)
     t.pinch_off_ratio = _clamp(t.pinch_off_ratio, t.pinch_on_ratio, 1.0, max(0.42, t.pinch_on_ratio + 0.05))
-    t.swipe_min_speed = _clamp(t.swipe_min_speed, 0.05, 50.0, 1.8)
-    t.swipe_min_travel = _clamp(t.swipe_min_travel, 0.01, 2.0, 0.18)
-    t.swipe_max_duration_ms = _clamp(t.swipe_max_duration_ms, 50.0, 5000.0, 550.0)
-    t.wave_min_direction_changes = int(_clamp(t.wave_min_direction_changes, 1, 20, 3))
-    t.wave_window_ms = _clamp(t.wave_window_ms, 100.0, 10000.0, 1200.0)
-    t.circle_min_radius = _clamp(t.circle_min_radius, 0.005, 2.0, 0.05)
-    t.circle_min_coverage = _clamp(t.circle_min_coverage, 0.1, 1.0, 0.7)
+    t.custom_gesture_match_threshold = _clamp(t.custom_gesture_match_threshold, 0.02, 3.0, 0.35)
     t.snap_velocity_threshold = _clamp(t.snap_velocity_threshold, 0.1, 100.0, 6.5)
     t.snap_min_pre_distance = _clamp(t.snap_min_pre_distance, 0.01, 2.0, 0.12)
     t.snap_max_trigger_distance = _clamp(t.snap_max_trigger_distance, 0.001, t.snap_min_pre_distance, min(0.06, t.snap_min_pre_distance))

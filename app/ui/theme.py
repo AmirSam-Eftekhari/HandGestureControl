@@ -269,4 +269,30 @@ def build_stylesheet() -> str:
         padding: 4px 8px;
         font-size: {t.size_sm}px;
     }}
+
+    QLineEdit {{
+        background-color: {t.bg_elevated};
+        border: 1px solid {t.border};
+        border-radius: {t.radius_sm}px;
+        padding: 7px 10px;
+        font-size: {t.size_sm}px;
+        color: {t.text_primary};
+        selection-background-color: {t.accent_soft};
+    }}
+    QLineEdit:focus {{
+        border-color: {t.accent};
+    }}
+    QLineEdit:disabled {{
+        color: {t.text_tertiary};
+    }}
+
+    QProgressBar {{
+        background-color: {t.bg_elevated};
+        border: none;
+        border-radius: 3px;
+    }}
+    QProgressBar::chunk {{
+        background-color: {t.accent};
+        border-radius: 3px;
+    }}
     """

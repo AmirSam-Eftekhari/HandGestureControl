@@ -48,6 +48,7 @@ from app.actions.action_registry import ActionContext
 from app.actions.mapping import ActionDispatcher
 from app.camera.camera_manager import CapturedFrame
 from app.config.schema import AppConfig, DetectionConfig
+from app.gestures.custom_gestures import CustomGestureTemplate
 from app.gestures.gesture_engine import GestureEngine, GestureEvent
 from app.gestures.pinch import PinchVolumeController, PinchVolumeState
 from app.tracking.multi_hand_tracker import MultiHandTracker
@@ -104,7 +105,7 @@ class PipelineWorker(QObject):
     backend_error = Signal(str, str)      # (user_message, technical_detail)
     backend_ready = Signal()
 
-    def __init__(self, config: AppConfig, action_context: ActionContext):
+    def __init__(self, config: AppConfig, action_context: ActionContext, custom_gestures: Optional[List[CustomGestureTemplate]] = None):
         super().__init__()
         self.config = config
         self._action_context = action_context
@@ -112,7 +113,7 @@ class PipelineWorker(QObject):
         self._backend: Optional[HandDetectorBackend] = None
         self._tracker = MultiHandTracker(config.detection)
         self._smoother = HandLandmarkSmoother(config.smoothing)
-        self._gesture_engine = GestureEngine(config.gestures.thresholds)
+        self._gesture_engine = GestureEngine(config.gestures.thresholds, custom_gestures)
         self._dispatcher = ActionDispatcher(config.gestures.mappings, action_context)
         self._pinch_controller = PinchVolumeController(config.pinch_volume)
         self._renderer = OverlayRenderer(trail_length=config.visualization.trail_length)
@@ -124,6 +125,7 @@ class PipelineWorker(QObject):
 
         self._config_mutex = QMutex()
         self._pending_config: Optional[AppConfig] = None
+        self._pending_custom_gestures: Optional[List[CustomGestureTemplate]] = None
 
         self._running = False
         self._paused = False
@@ -142,6 +144,7 @@ class PipelineWorker(QObject):
 
         while self._running:
             self._apply_pending_config_if_any()
+            self._apply_pending_custom_gestures_if_any()
             frame = self._take_latest_frame()
             if frame is None:
                 time.sleep(0.002)
@@ -178,6 +181,13 @@ class PipelineWorker(QObject):
         self._pending_config = config
         self._config_mutex.unlock()
 
+    def set_custom_gestures(self, templates: List[CustomGestureTemplate]) -> None:
+        """Safe to call from any thread, same pending-value handoff
+        pattern as apply_config() and for the same reason."""
+        self._config_mutex.lock()
+        self._pending_custom_gestures = list(templates)
+        self._config_mutex.unlock()
+
     def pinch_volume_controller(self) -> PinchVolumeController:
         return self._pinch_controller
 
@@ -190,6 +200,14 @@ class PipelineWorker(QObject):
         self._config_mutex.unlock()
         if pending is not None:
             self._apply_config_now(pending)
+
+    def _apply_pending_custom_gestures_if_any(self) -> None:
+        self._config_mutex.lock()
+        pending = self._pending_custom_gestures
+        self._pending_custom_gestures = None
+        self._config_mutex.unlock()
+        if pending is not None:
+            self._gesture_engine.set_custom_gestures(pending)
 
     def _apply_config_now(self, config: AppConfig) -> None:
         old_detection = self.config.detection
@@ -348,9 +366,8 @@ class PipelineWorker(QObject):
                     geometry_by_id[hand.hand_id] = geometry
                     finger_states = classify_fingers(geometry, self.config.gestures.thresholds, hand.detection_score)
 
-                    track = self._tracker.get_track(hand.hand_id)
                     hand_events = self._gesture_engine.process_hand(
-                        hand, geometry, finger_states, track, hand.detection_score
+                        hand, geometry, finger_states, hand.detection_score
                     )
                     events.extend(hand_events)
 
@@ -433,11 +450,11 @@ class FramePipeline(QObject):
     backend_error = Signal(str, str)
     backend_ready = Signal()
 
-    def __init__(self, config: AppConfig, action_context: ActionContext):
+    def __init__(self, config: AppConfig, action_context: ActionContext, custom_gestures: Optional[List[CustomGestureTemplate]] = None):
         super().__init__()
         self._thread = QThread()
         self._thread.setObjectName("PipelineWorkerThread")
-        self._worker = PipelineWorker(config, action_context)
+        self._worker = PipelineWorker(config, action_context, custom_gestures)
         self._worker.moveToThread(self._thread)
 
         self._thread.started.connect(self._worker.start_loop)
@@ -468,6 +485,9 @@ class FramePipeline(QObject):
 
     def apply_config(self, config: AppConfig) -> None:
         self._worker.apply_config(config)
+
+    def set_custom_gestures(self, templates: List[CustomGestureTemplate]) -> None:
+        self._worker.set_custom_gestures(templates)
 
     def pinch_volume_controller(self) -> PinchVolumeController:
         return self._worker.pinch_volume_controller()

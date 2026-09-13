@@ -16,14 +16,9 @@ DEFAULT_MAPPINGS = [
     ActionMappingEntry(gesture_id="snap", action_id="take_screenshot", enabled=True, cooldown_ms=450.0),
     ActionMappingEntry(gesture_id="open_palm", action_id="pause_resume_tracking", enabled=True, cooldown_ms=700.0),
     ActionMappingEntry(gesture_id="fist", action_id="cancel_gesture_mode", enabled=False, cooldown_ms=500.0),
-    ActionMappingEntry(gesture_id="swipe_left", action_id="media_previous", enabled=False, cooldown_ms=500.0),
-    ActionMappingEntry(gesture_id="swipe_right", action_id="media_next", enabled=False, cooldown_ms=500.0),
-    ActionMappingEntry(gesture_id="swipe_up", action_id="volume_up_step", enabled=False, cooldown_ms=350.0),
-    ActionMappingEntry(gesture_id="swipe_down", action_id="volume_down_step", enabled=False, cooldown_ms=350.0),
     ActionMappingEntry(gesture_id="thumb_up", action_id="confirm_noop", enabled=False, cooldown_ms=600.0),
     ActionMappingEntry(gesture_id="thumb_down", action_id="cancel_noop", enabled=False, cooldown_ms=600.0),
     ActionMappingEntry(gesture_id="peace", action_id="toggle_skeleton", enabled=False, cooldown_ms=600.0),
-    ActionMappingEntry(gesture_id="wave", action_id="toggle_mirror", enabled=False, cooldown_ms=800.0),
 ]
 
 GESTURE_LABELS = {
@@ -37,14 +32,7 @@ GESTURE_LABELS = {
     "pinch": "Pinch",
     "three_fingers": "Three Fingers",
     "four_fingers": "Four Fingers",
-    "swipe_left": "Swipe Left",
-    "swipe_right": "Swipe Right",
-    "swipe_up": "Swipe Up",
-    "swipe_down": "Swipe Down",
-    "wave": "Hand Wave",
-    "circle": "Circular Motion",
     "snap": "Finger Snap",
-    "pinch_drag": "Pinch & Drag",
 }
 
 ACTION_LABELS = {

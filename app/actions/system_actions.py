@@ -15,6 +15,30 @@ platform-specific library dependency:
 * macOS   -> osascript (AppleScript's "set volume")
 * Windows -> pycaw (COM), imported lazily and only on Windows, since it
              has no equivalent zero-dependency CLI tool
+
+--- Windows COM threading (why volume control previously did nothing) ---
+
+pycaw's audio endpoint is a COM interface pointer, and COM interface
+pointers are apartment-threaded: a pointer activated on one thread
+cannot be safely called from a *different* OS thread unless that other
+thread has also called ``CoInitialize()`` for itself. An earlier version
+of this class activated the endpoint once, in ``__init__`` -- which runs
+on the GUI thread -- and cached it. Actual volume calls, however, are
+dispatched through ``BackgroundExecutor`` (see ``app/utils/background_executor.py``)
+specifically so they never block the GUI or realtime pipeline threads,
+which means they run on a *third*, separate OS thread that never
+initialized COM at all. Calling a COM method from a thread that never
+initialized COM -- using a pointer that belongs to a different thread's
+apartment -- is undefined/silently-failing behavior on Windows. This is
+the most likely root cause of "volume commands don't reach the system."
+
+The fix: never share one COM pointer across threads. Every thread that
+actually issues a Windows volume command lazily activates and caches
+*its own* endpoint, in thread-local storage, after calling
+``CoInitialize()`` on itself first. Since ``BackgroundExecutor`` runs
+its callables on a single persistent worker thread, this naturally
+converges to one activation per process in practice, it's just no longer
+assumed to be safe to do "wherever the constructor happens to run."
 """
 
 from __future__ import annotations
@@ -22,6 +46,7 @@ from __future__ import annotations
 import logging
 import platform
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -39,11 +64,12 @@ class SystemVolumeController:
 
     def __init__(self):
         self._linux_tool = self._detect_linux_tool() if _SYSTEM == "Linux" else None
-        self._pycaw_endpoint = self._init_pycaw() if _SYSTEM == "Windows" else None
+        self._windows_local = threading.local()  # per-thread COM state, see module docstring
+        self._windows_capable = self._probe_windows_capability() if _SYSTEM == "Windows" else False
         self.available = bool(
             (_SYSTEM == "Linux" and self._linux_tool)
             or (_SYSTEM == "Darwin")
-            or (_SYSTEM == "Windows" and self._pycaw_endpoint is not None)
+            or (_SYSTEM == "Windows" and self._windows_capable)
         )
         if not self.available:
             logger.warning("No supported system volume backend found on %s; volume actions are disabled.", _SYSTEM)
@@ -59,17 +85,50 @@ class SystemVolumeController:
         return None
 
     @staticmethod
-    def _init_pycaw() -> Optional[object]:
+    def _probe_windows_capability() -> bool:
+        """One-time, cheap capability check: can pycaw/comtypes be
+        imported and can a default playback device actually be found?
+        Deliberately does NOT cache a COM pointer from this call for
+        later use on another thread -- see module docstring. Whatever
+        thread calls this pays a small one-time COM init/uninit cost,
+        which is fine since it only happens once at startup."""
         try:
-            from ctypes import cast, POINTER  # noqa: F401
+            import comtypes
+            from pycaw.pycaw import AudioUtilities
+
+            comtypes.CoInitialize()
+            try:
+                devices = AudioUtilities.GetSpeakers()
+                return devices is not None
+            finally:
+                comtypes.CoUninitialize()
+        except Exception as exc:  # pycaw/comtypes missing, or no audio device
+            logger.warning("pycaw/comtypes unavailable, Windows volume control disabled: %s", exc)
+            return False
+
+    def _get_windows_endpoint(self):
+        """Returns a COM audio-endpoint interface pointer valid for the
+        *current* thread, activating and caching one the first time this
+        particular thread calls in. See module docstring for why this
+        must never be shared across threads."""
+        cached = getattr(self._windows_local, "endpoint", None)
+        if cached is not None:
+            return cached
+        try:
+            from ctypes import cast, POINTER
+
+            import comtypes
             from comtypes import CLSCTX_ALL
             from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
+            comtypes.CoInitialize()  # safe to call more than once per thread; comtypes tracks it
             devices = AudioUtilities.GetSpeakers()
             interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            return cast(interface, POINTER(IAudioEndpointVolume))
-        except Exception as exc:  # pycaw/comtypes missing, or no audio device
-            logger.warning("pycaw unavailable, Windows volume control disabled: %s", exc)
+            endpoint = cast(interface, POINTER(IAudioEndpointVolume))
+            self._windows_local.endpoint = endpoint
+            return endpoint
+        except Exception:
+            logger.exception("Failed to activate the Windows audio endpoint on this thread")
             return None
 
     def set_volume_percent(self, percent: int) -> None:
@@ -81,8 +140,10 @@ class SystemVolumeController:
                 self._set_linux(percent)
             elif _SYSTEM == "Darwin":
                 subprocess.run(["osascript", "-e", f"set volume output volume {percent}"], check=False, timeout=1.0)
-            elif _SYSTEM == "Windows" and self._pycaw_endpoint is not None:
-                self._pycaw_endpoint.SetMasterVolumeLevelScalar(percent / 100.0, None)
+            elif _SYSTEM == "Windows":
+                endpoint = self._get_windows_endpoint()
+                if endpoint is not None:
+                    endpoint.SetMasterVolumeLevelScalar(percent / 100.0, None)
         except Exception:
             logger.exception("Failed to set system volume")
 
@@ -120,8 +181,11 @@ class SystemVolumeController:
                     capture_output=True, text=True, timeout=1.0, check=False,
                 )
                 return int(result.stdout.strip())
-            if _SYSTEM == "Windows" and self._pycaw_endpoint is not None:
-                return round(self._pycaw_endpoint.GetMasterVolumeLevelScalar() * 100)
+            if _SYSTEM == "Windows":
+                endpoint = self._get_windows_endpoint()
+                if endpoint is not None:
+                    return round(endpoint.GetMasterVolumeLevelScalar() * 100)
+                return None
             # Reading current volume from pactl/amixer output reliably
             # across distros is brittle enough that we intentionally don't
             # guess here; callers fall back to a sane default instead.
@@ -140,9 +204,11 @@ class SystemVolumeController:
                 subprocess.run(["amixer", "set", "Master", "toggle"], check=False, timeout=1.0)
             elif _SYSTEM == "Darwin":
                 subprocess.run(["osascript", "-e", "set volume output muted (output muted of (get volume settings) is false)"], check=False, timeout=1.0)
-            elif _SYSTEM == "Windows" and self._pycaw_endpoint is not None:
-                muted = self._pycaw_endpoint.GetMute()
-                self._pycaw_endpoint.SetMute(0 if muted else 1, None)
+            elif _SYSTEM == "Windows":
+                endpoint = self._get_windows_endpoint()
+                if endpoint is not None:
+                    muted = endpoint.GetMute()
+                    endpoint.SetMute(0 if muted else 1, None)
         except Exception:
             logger.exception("Failed to toggle mute")
 

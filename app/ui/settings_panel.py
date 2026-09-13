@@ -313,7 +313,11 @@ class SettingsPanel(QWidget):
             lambda v: setattr(self.config.gestures.thresholds, "pinch_on_ratio", v),
             tooltip="Thumb-to-index distance (relative to hand size) that counts as a pinch.",
         )
-        self._add_slider_spin(form, "Swipe min speed", cfg.swipe_min_speed, 0.3, 6.0, 0.1, lambda v: setattr(self.config.gestures.thresholds, "swipe_min_speed", v))
+        self._add_slider_spin(
+            form, "Custom gesture sensitivity", cfg.custom_gesture_match_threshold, 0.05, 1.0, 0.01,
+            lambda v: setattr(self.config.gestures.thresholds, "custom_gesture_match_threshold", v),
+            tooltip="How closely a live pose must match a recorded custom gesture. Lower = stricter.",
+        )
         self._add_slider_spin(form, "Snap velocity threshold", cfg.snap_velocity_threshold, 1.0, 15.0, 0.5, lambda v: setattr(self.config.gestures.thresholds, "snap_velocity_threshold", v))
         self._add_slider_spin(form, "Snap cooldown (ms)", cfg.snap_cooldown_ms, 100.0, 2000.0, 50.0, lambda v: setattr(self.config.gestures.thresholds, "snap_cooldown_ms", v))
         return tab

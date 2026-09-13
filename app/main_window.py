@@ -30,10 +30,13 @@ from PySide6.QtWidgets import (
 from app.actions.action_registry import ActionContext
 from app.actions.system_actions import KeyboardAndMediaController, ScreenshotService, SystemVolumeController
 from app.camera.camera_manager import CameraDeviceInfo, CameraManager, CapturedFrame, enumerate_cameras_async
-from app.config.schema import AppConfig
+from app.config.schema import AppConfig, ActionMappingEntry
 from app.config.settings import get_config_dir, load_config, save_config
 from app.config.defaults import DEFAULT_MAPPINGS
+from app.config.custom_gestures_store import load_custom_gestures, save_custom_gestures
+from app.gestures.custom_gestures import CustomGestureTemplate
 from app.pipeline.frame_pipeline import FramePipeline, PipelineResult
+from app.ui.custom_gesture_dialog import CustomGestureRecorderDialog
 from app.ui.gesture_mapping_panel import GestureMappingPanel
 from app.ui.icons import icon
 from app.ui.settings_panel import SettingsPanel
@@ -74,9 +77,11 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(build_stylesheet())
 
         self.config: AppConfig = load_config()
+        self.custom_gestures: List[CustomGestureTemplate] = load_custom_gestures()
         self._tracking_paused = False
         self._last_annotated_frame = None
         self._latest_pipeline_result = None
+        self._active_gesture_recorder: CustomGestureRecorderDialog | None = None
 
         # Constructed here (on the GUI thread, since __init__ always runs
         # on whichever thread creates this QObject) so both are correctly
@@ -183,9 +188,11 @@ class MainWindow(QMainWindow):
         self.right_tabs = QTabWidget()
         self.right_tabs.setUsesScrollButtons(True)
         self.right_tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
-        self.gesture_mapping_panel = GestureMappingPanel(self.config.gestures.mappings)
+        self.gesture_mapping_panel = GestureMappingPanel(self.config.gestures.mappings, self.custom_gestures)
         self.gesture_mapping_panel.mappings_changed.connect(self._on_settings_edited)
         self.gesture_mapping_panel.restore_defaults_requested.connect(self._restore_default_mappings)
+        self.gesture_mapping_panel.record_gesture_requested.connect(self._open_gesture_recorder)
+        self.gesture_mapping_panel.custom_gesture_delete_requested.connect(self._delete_custom_gesture)
         self.right_tabs.addTab(self.gesture_mapping_panel, "Mapping")
 
         self.settings_panel = SettingsPanel(self.config, [])
@@ -268,7 +275,7 @@ class MainWindow(QMainWindow):
         self.camera_manager.error_occurred.connect(self._on_camera_error)
         self.camera_manager.reconnecting.connect(self._on_camera_reconnecting)
 
-        self.pipeline = FramePipeline(self.config, self.action_context)
+        self.pipeline = FramePipeline(self.config, self.action_context, self.custom_gestures)
         self.pipeline.result_ready.connect(self._on_pipeline_result)
         self.pipeline.backend_error.connect(self._on_backend_error)
         self.pipeline.backend_ready.connect(self._on_backend_ready)
@@ -358,6 +365,9 @@ class MainWindow(QMainWindow):
         self.camera_view.update_frame(result.annotated_frame)
         self._latest_pipeline_result = result
 
+        if self._active_gesture_recorder is not None:
+            self._active_gesture_recorder.update_live_frame(result.hands)
+
         for event in result.events:
             self.gesture_history.add_event(event)
             self._toast(f"{event.gesture_id.replace('_', ' ').title()} ({event.handedness})", "info", duration_ms=1400)
@@ -444,7 +454,19 @@ class MainWindow(QMainWindow):
         controller = self.pipeline.pinch_volume_controller()
         if enabled:
             controller.enable()
-            self._toast("Pinch volume control enabled", "info")
+            if self._volume_controller.available:
+                self._toast("Pinch volume control enabled", "info")
+            else:
+                # Turning this on with no working system-volume backend
+                # would otherwise look identical to it silently doing
+                # nothing -- say so plainly instead, rather than letting
+                # the person wonder why pinching doesn't change anything.
+                self._toast(
+                    "Pinch volume enabled, but no system volume backend was found on this machine \u2014 "
+                    "see logs/app.log for details. Volume won't actually change.",
+                    "warning",
+                    duration_ms=5000,
+                )
         else:
             controller.disable()
             self._toast("Pinch volume control disabled", "info")
@@ -463,11 +485,78 @@ class MainWindow(QMainWindow):
         self._toast("Settings restored to defaults. Restart to fully apply.", "info")
 
     def _restore_default_mappings(self) -> None:
-        self.config.gestures.mappings = copy.deepcopy(DEFAULT_MAPPINGS)
+        # Restores built-in gesture mappings to their factory state, but
+        # preserves the user's own custom-gesture mappings -- those are
+        # the user's own content, not something a "restore defaults" on
+        # the built-in table should silently discard.
+        custom_entries = [m for m in self.config.gestures.mappings if m.gesture_id.startswith("custom:")]
+        self.config.gestures.mappings = copy.deepcopy(DEFAULT_MAPPINGS) + custom_entries
         self.gesture_mapping_panel.set_mappings(self.config.gestures.mappings)
         self.pipeline.apply_config(self.config)
         self._persist_config()
-        self._toast("Gesture mappings restored to defaults.", "info")
+        self._toast("Built-in gesture mappings restored to defaults.", "info")
+
+    def _open_gesture_recorder(self) -> None:
+        if self._active_gesture_recorder is not None:
+            self._active_gesture_recorder.raise_()
+            self._active_gesture_recorder.activateWindow()
+            return
+        dialog = CustomGestureRecorderDialog(self)
+        dialog.gesture_saved.connect(self._on_gesture_recorded)
+        dialog.finished.connect(lambda _=0: self._on_gesture_recorder_closed())
+        self._active_gesture_recorder = dialog
+        dialog.show()
+
+    def _on_gesture_recorder_closed(self) -> None:
+        self._active_gesture_recorder = None
+
+    def _on_gesture_recorded(self, template: CustomGestureTemplate, action_id: str) -> None:
+        self.custom_gestures.append(template)
+        new_mapping = ActionMappingEntry(gesture_id=template.gesture_id, action_id=action_id, enabled=True, cooldown_ms=400.0)
+        self.config.gestures.mappings.append(new_mapping)
+
+        self.pipeline.set_custom_gestures(self.custom_gestures)
+        self.pipeline.apply_config(self.config)
+        self.gesture_mapping_panel.set_custom_gestures(self.custom_gestures, rebuild=False)
+        self.gesture_mapping_panel.set_mappings(self.config.gestures.mappings)
+
+        self._persist_config()
+        try:
+            save_custom_gestures(self.custom_gestures)
+        except OSError:
+            logger.exception("Failed to save custom gestures")
+
+        self._toast(f"\u201c{template.name}\u201d recorded and mapped.", "success")
+
+    def _delete_custom_gesture(self, gesture_id: str) -> None:
+        template = next((t for t in self.custom_gestures if t.gesture_id == gesture_id), None)
+        name = template.name if template else gesture_id
+
+        confirmed = QMessageBox.question(
+            self,
+            "Delete Custom Gesture",
+            f"Delete \u201c{name}\u201d? This can't be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmed != QMessageBox.StandardButton.Yes:
+            return
+
+        self.custom_gestures = [t for t in self.custom_gestures if t.gesture_id != gesture_id]
+        self.config.gestures.mappings = [m for m in self.config.gestures.mappings if m.gesture_id != gesture_id]
+
+        self.pipeline.set_custom_gestures(self.custom_gestures)
+        self.pipeline.apply_config(self.config)
+        self.gesture_mapping_panel.set_custom_gestures(self.custom_gestures, rebuild=False)
+        self.gesture_mapping_panel.set_mappings(self.config.gestures.mappings)
+
+        self._persist_config()
+        try:
+            save_custom_gestures(self.custom_gestures)
+        except OSError:
+            logger.exception("Failed to save custom gestures")
+
+        self._toast(f"\u201c{name}\u201d deleted.", "info")
 
     def _persist_config(self) -> None:
         try:

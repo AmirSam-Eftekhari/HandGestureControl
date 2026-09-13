@@ -62,6 +62,25 @@ hiddenimports = mediapipe_hidden + cv2_hidden + [
     "app.vision.mock_backend",
 ]
 
+# pycaw/comtypes (Windows-only system volume control -- see
+# app/actions/system_actions.py) are only installed when building on
+# Windows itself (requirements.txt guards them with
+# `sys_platform == "win32"`), so this is wrapped in a try/except: it's a
+# no-op when building on another platform, and on Windows it makes sure
+# comtypes' supporting submodules (which PyInstaller's default import
+# analysis has been known to miss, since comtypes does some of its own
+# dynamic module setup) are bundled -- silently missing one of these is
+# exactly the kind of thing that would make Windows volume control fail
+# only in the packaged build, not when running from source.
+try:
+    pycaw_datas, pycaw_binaries, pycaw_hidden = collect_all("pycaw")
+    comtypes_datas, comtypes_binaries, comtypes_hidden = collect_all("comtypes")
+    datas += pycaw_datas + comtypes_datas
+    binaries += pycaw_binaries + comtypes_binaries
+    hiddenimports += pycaw_hidden + comtypes_hidden
+except Exception:
+    pass
+
 _UNUSED_QT_MODULES = [
     "PySide6.QtWebEngineCore", "PySide6.QtWebEngineQuick", "PySide6.QtWebEngineWidgets",
     "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtQuick3D", "PySide6.QtQuickWidgets",

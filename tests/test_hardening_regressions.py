@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import math
 import sys
+import threading
 import time
 from unittest import mock
 
 import numpy as np
+import pytest
 
 from app.config.schema import AppConfig, DetectionConfig
 from app.vision.landmarks import HandObservation, Landmark
@@ -551,3 +553,140 @@ def test_gui_invoker_catches_exceptions_in_the_marshaled_callable():
         time.sleep(0.005)
     # Reaching here without an unhandled exception tearing down the
     # event loop is the assertion.
+
+
+# ---------------------------------------------------------------------------
+# Windows volume control: per-thread COM endpoint (the volume-control bug)
+# ---------------------------------------------------------------------------
+#
+# We're not on Windows in this sandbox, so pycaw/comtypes are mocked in
+# sys.modules -- what's actually under test is SystemVolumeController's
+# OWN thread-local caching logic (the fix for the real bug: a COM
+# pointer activated on one OS thread silently not working when called
+# from another), not pycaw itself.
+
+
+def _install_fake_pycaw(monkeypatch):
+    import sys
+    import types
+
+    activate_calls = []
+
+    class FakeEndpoint:
+        def __init__(self):
+            self.last_volume = None
+
+        def SetMasterVolumeLevelScalar(self, value, _):
+            self.last_volume = value
+
+        def GetMasterVolumeLevelScalar(self):
+            return self.last_volume or 0.0
+
+        def GetMute(self):
+            return 0
+
+        def SetMute(self, value, _):
+            pass
+
+    class FakeDevices:
+        def Activate(self, iid, clsctx, extra):
+            activate_calls.append(threading.get_ident())
+            return object()
+
+    fake_comtypes = types.ModuleType("comtypes")
+    fake_comtypes.CLSCTX_ALL = 0
+    fake_comtypes.CoInitialize = lambda: None
+    fake_comtypes.CoUninitialize = lambda: None
+
+    fake_pycaw_pkg = types.ModuleType("pycaw")
+    fake_pycaw_mod = types.ModuleType("pycaw.pycaw")
+
+    class FakeAudioUtilities:
+        @staticmethod
+        def GetSpeakers():
+            return FakeDevices()
+
+    class FakeIAudioEndpointVolume:
+        _iid_ = object()
+
+    fake_pycaw_mod.AudioUtilities = FakeAudioUtilities
+    fake_pycaw_mod.IAudioEndpointVolume = FakeIAudioEndpointVolume
+
+    monkeypatch.setitem(sys.modules, "comtypes", fake_comtypes)
+    monkeypatch.setitem(sys.modules, "pycaw", fake_pycaw_pkg)
+    monkeypatch.setitem(sys.modules, "pycaw.pycaw", fake_pycaw_mod)
+
+    fake_endpoint = FakeEndpoint()
+    monkeypatch.setattr("ctypes.cast", lambda interface, type_: fake_endpoint, raising=False)
+    monkeypatch.setattr("ctypes.POINTER", lambda type_: object, raising=False)
+
+    return activate_calls, fake_endpoint
+
+
+def test_windows_endpoint_is_activated_separately_per_thread(monkeypatch):
+    from app.actions.system_actions import SystemVolumeController
+
+    activate_calls, _ = _install_fake_pycaw(monkeypatch)
+
+    controller = SystemVolumeController.__new__(SystemVolumeController)  # skip __init__'s platform probing
+    controller._windows_local = threading.local()
+
+    results = {}
+    # A barrier forces both threads to be genuinely alive at the same
+    # moment they call in -- necessary because sequential (non-
+    # overlapping) threads can be handed the same recycled OS thread id
+    # by the runtime, which would make this test pass or fail by
+    # accident rather than actually exercising concurrent access.
+    barrier = threading.Barrier(2)
+
+    def call_from_thread(name):
+        barrier.wait(timeout=2.0)
+        endpoint = controller._get_windows_endpoint()
+        results[name] = endpoint
+
+    t1 = threading.Thread(target=call_from_thread, args=("t1",))
+    t2 = threading.Thread(target=call_from_thread, args=("t2",))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # The regression this guards against: an earlier version activated
+    # the COM endpoint exactly once (on whichever thread constructed the
+    # controller) and reused that same pointer everywhere. Here, two
+    # *different* threads each calling in for the first time must each
+    # trigger their own activation.
+    assert len(activate_calls) == 2
+    assert activate_calls[0] != activate_calls[1]
+
+
+def test_windows_endpoint_is_cached_within_the_same_thread(monkeypatch):
+    from app.actions.system_actions import SystemVolumeController
+
+    activate_calls, _ = _install_fake_pycaw(monkeypatch)
+
+    controller = SystemVolumeController.__new__(SystemVolumeController)
+    controller._windows_local = threading.local()
+
+    controller._get_windows_endpoint()
+    controller._get_windows_endpoint()
+    controller._get_windows_endpoint()
+
+    # Same thread calling repeatedly must reuse its cached endpoint, not
+    # re-activate a new COM pointer every single volume command.
+    assert len(activate_calls) == 1
+
+
+def test_set_volume_percent_actually_calls_through_on_windows(monkeypatch):
+    import app.actions.system_actions as system_actions_module
+    from app.actions.system_actions import SystemVolumeController
+
+    monkeypatch.setattr(system_actions_module, "_SYSTEM", "Windows")
+    _, fake_endpoint = _install_fake_pycaw(monkeypatch)
+
+    controller = SystemVolumeController.__new__(SystemVolumeController)
+    controller._windows_local = threading.local()
+    controller.available = True
+
+    controller.set_volume_percent(77)
+    assert fake_endpoint.last_volume == pytest.approx(0.77)
