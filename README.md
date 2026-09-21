@@ -256,6 +256,8 @@ HandGestureControl/
 │
 ├── configs/
 │
+├── docs/
+│
 ├── main.py
 ├── requirements.txt
 ├── LICENSE
