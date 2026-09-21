@@ -9,9 +9,6 @@ mediapipe>=0.10.14
 # UI
 PySide6>=6.6
 
-# Testing
-pytest>=8.0
-
 # --- Optional, platform-dependent extras ---
 # Keyboard-shortcut / media-key actions (Settings > Gesture Mapping).
 # The app runs fully without this -- app/actions/system_actions.py

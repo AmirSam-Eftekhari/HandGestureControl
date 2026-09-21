@@ -1,0 +1,4 @@
+# Development / test dependencies only.
+# Install with:  pip install -r requirements-dev.txt
+# Not required to run the application.
+pytest>=8.0

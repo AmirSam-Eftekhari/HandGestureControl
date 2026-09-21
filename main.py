@@ -26,6 +26,8 @@ from __future__ import annotations
 import logging
 import sys
 
+__version__ = "0.1.0"
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
@@ -69,7 +71,7 @@ def _configure_application_icon(app: QApplication) -> None:
 def main() -> int:
     log_path = setup_logging(level=logging.INFO)
     logger = logging.getLogger(__name__)
-    logger.info("Starting Hand Gesture Control %s. Logs at: %s", "(frozen)" if getattr(sys, "frozen", False) else "", log_path)
+    logger.info("Starting Hand Gesture Control %s %s. Logs at: %s", __version__, "(frozen)" if getattr(sys, "frozen", False) else "", log_path)
 
     _configure_high_dpi()
 

@@ -1,22 +1,50 @@
+# Bytecode / caches
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
 .venv/
 venv/
-*.egg-info/
+.env/
+.venv-build/
 
 # Downloaded ML model (fetched by scripts/download_models.py)
 assets/models/*.task
 
-# Local run artifacts
+# Local run / user artifacts
 *.log
+logs/
 .DS_Store
+Thumbs.db
+Desktop.ini
 
-# Build artifacts
-.venv-build/
-build/
-dist/
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Build / packaging artifacts
 release/
 *.spec.bak
 warn-*.txt
 xref-*.html
+
+# OS
+ehthumbs.db

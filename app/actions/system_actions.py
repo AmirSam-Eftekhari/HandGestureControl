@@ -57,19 +57,29 @@ _SYSTEM = platform.system()  # "Linux", "Darwin", "Windows"
 
 
 class SystemVolumeController:
-    """Best-effort cross-platform master volume control. If no supported
-    backend is found, every call is a safe no-op and ``available`` is
-    False so the UI can tell the user why volume gestures aren't doing
-    anything instead of silently failing."""
+    """Best-effort cross-platform master volume control.
+
+    Windows intentionally uses the native multimedia volume keys for writes.
+    This avoids the fragile COM apartment/lifetime issues that can make pycaw
+    appear to work while silently failing from a worker thread. pycaw remains
+    an optional read-back backend so absolute pinch control can synchronize to
+    the user's current Windows volume when available.
+    """
+
+    _VK_VOLUME_MUTE = 0xAD
+    _VK_VOLUME_DOWN = 0xAE
+    _VK_VOLUME_UP = 0xAF
+    _KEYEVENTF_KEYUP = 0x0002
+    _WINDOWS_STEP_PERCENT = 2
 
     def __init__(self):
         self._linux_tool = self._detect_linux_tool() if _SYSTEM == "Linux" else None
-        self._windows_local = threading.local()  # per-thread COM state, see module docstring
-        self._windows_capable = self._probe_windows_capability() if _SYSTEM == "Windows" else False
+        self._windows_current_percent: Optional[int] = None
+        self._windows_read_attempted = False
         self.available = bool(
             (_SYSTEM == "Linux" and self._linux_tool)
             or (_SYSTEM == "Darwin")
-            or (_SYSTEM == "Windows" and self._windows_capable)
+            or (_SYSTEM == "Windows")
         )
         if not self.available:
             logger.warning("No supported system volume backend found on %s; volume actions are disabled.", _SYSTEM)
@@ -84,52 +94,60 @@ class SystemVolumeController:
                 continue
         return None
 
-    @staticmethod
-    def _probe_windows_capability() -> bool:
-        """One-time, cheap capability check: can pycaw/comtypes be
-        imported and can a default playback device actually be found?
-        Deliberately does NOT cache a COM pointer from this call for
-        later use on another thread -- see module docstring. Whatever
-        thread calls this pays a small one-time COM init/uninit cost,
-        which is fine since it only happens once at startup."""
+    def _windows_read_volume(self) -> Optional[int]:
+        """Best-effort pycaw read, performed only on the action worker thread."""
+        if _SYSTEM != "Windows":
+            return None
         try:
             import comtypes
-            from pycaw.pycaw import AudioUtilities
-
-            comtypes.CoInitialize()
-            try:
-                devices = AudioUtilities.GetSpeakers()
-                return devices is not None
-            finally:
-                comtypes.CoUninitialize()
-        except Exception as exc:  # pycaw/comtypes missing, or no audio device
-            logger.warning("pycaw/comtypes unavailable, Windows volume control disabled: %s", exc)
-            return False
-
-    def _get_windows_endpoint(self):
-        """Returns a COM audio-endpoint interface pointer valid for the
-        *current* thread, activating and caching one the first time this
-        particular thread calls in. See module docstring for why this
-        must never be shared across threads."""
-        cached = getattr(self._windows_local, "endpoint", None)
-        if cached is not None:
-            return cached
-        try:
-            from ctypes import cast, POINTER
-
-            import comtypes
+            from ctypes import POINTER, cast
             from comtypes import CLSCTX_ALL
             from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
-            comtypes.CoInitialize()  # safe to call more than once per thread; comtypes tracks it
-            devices = AudioUtilities.GetSpeakers()
-            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            endpoint = cast(interface, POINTER(IAudioEndpointVolume))
-            self._windows_local.endpoint = endpoint
-            return endpoint
-        except Exception:
-            logger.exception("Failed to activate the Windows audio endpoint on this thread")
+            comtypes.CoInitialize()
+            device = AudioUtilities.GetSpeakers()
+            endpoint = getattr(device, "EndpointVolume", None)
+            if endpoint is None:
+                interface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                endpoint = interface.QueryInterface(IAudioEndpointVolume)
+            value = float(endpoint.GetMasterVolumeLevelScalar())
+            return int(round(max(0.0, min(1.0, value)) * 100.0))
+        except Exception as exc:
+            logger.warning("Windows volume read-back unavailable; using native volume keys: %s", exc)
             return None
+
+    def _windows_key(self, virtual_key: int) -> None:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.keybd_event(virtual_key, 0, 0, 0)
+        user32.keybd_event(virtual_key, 0, self._KEYEVENTF_KEYUP, 0)
+
+    def _windows_sync_current(self) -> int:
+        if self._windows_current_percent is not None:
+            return self._windows_current_percent
+        if not self._windows_read_attempted:
+            self._windows_read_attempted = True
+            self._windows_current_percent = self._windows_read_volume()
+        if self._windows_current_percent is None:
+            # Relative volume keys still work even if pycaw is unavailable.
+            # 50 is only a local model; it is never claimed to be the real
+            # Windows value until a successful read-back is obtained.
+            self._windows_current_percent = 50
+        return self._windows_current_percent
+
+    def _windows_set_relative(self, target_percent: int) -> None:
+        current = self._windows_sync_current()
+        target = max(0, min(100, int(target_percent)))
+        delta = target - current
+        if delta == 0:
+            return
+        key = self._VK_VOLUME_UP if delta > 0 else self._VK_VOLUME_DOWN
+        presses = min(50, max(1, int(round(abs(delta) / self._WINDOWS_STEP_PERCENT))))
+        for _ in range(presses):
+            self._windows_key(key)
+        # Windows volume keys are normally 2% per press. Keep our model
+        # bounded; the next successful read can resynchronize it exactly.
+        self._windows_current_percent = max(0, min(100, current + (presses * self._WINDOWS_STEP_PERCENT * (1 if delta > 0 else -1))))
 
     def set_volume_percent(self, percent: int) -> None:
         percent = max(0, min(100, int(percent)))
@@ -141,9 +159,10 @@ class SystemVolumeController:
             elif _SYSTEM == "Darwin":
                 subprocess.run(["osascript", "-e", f"set volume output volume {percent}"], check=False, timeout=1.0)
             elif _SYSTEM == "Windows":
-                endpoint = self._get_windows_endpoint()
-                if endpoint is not None:
-                    endpoint.SetMasterVolumeLevelScalar(percent / 100.0, None)
+                # Native Windows multimedia keys are deliberately used for
+                # writes. They operate on the active system output without
+                # requiring a pycaw COM pointer to survive across threads.
+                self._windows_set_relative(percent)
         except Exception:
             logger.exception("Failed to set system volume")
 
@@ -154,17 +173,15 @@ class SystemVolumeController:
             subprocess.run(["amixer", "set", "Master", f"{percent}%"], check=False, timeout=1.0)
 
     def step_volume(self, direction: int, step_percent: int = 5) -> None:
-        """direction: +1 or -1. Steps relative to a best-effort current
-        reading; if reading current volume isn't supported, just nudges
-        via the OS's own relative-volume command where available."""
         if not self.available:
             return
         try:
             if _SYSTEM == "Linux" and self._linux_tool == "pactl":
                 sign = "+" if direction > 0 else "-"
-                subprocess.run(
-                    ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{sign}{step_percent}%"], check=False, timeout=1.0
-                )
+                subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{sign}{step_percent}%"], check=False, timeout=1.0)
+            elif _SYSTEM == "Windows":
+                current = self._windows_sync_current()
+                self._windows_set_relative(current + (step_percent if direction > 0 else -step_percent))
             else:
                 current = self.get_volume_percent() or 50
                 self.set_volume_percent(current + direction * step_percent)
@@ -182,13 +199,10 @@ class SystemVolumeController:
                 )
                 return int(result.stdout.strip())
             if _SYSTEM == "Windows":
-                endpoint = self._get_windows_endpoint()
-                if endpoint is not None:
-                    return round(endpoint.GetMasterVolumeLevelScalar() * 100)
-                return None
-            # Reading current volume from pactl/amixer output reliably
-            # across distros is brittle enough that we intentionally don't
-            # guess here; callers fall back to a sane default instead.
+                value = self._windows_read_volume()
+                if value is not None:
+                    self._windows_current_percent = value
+                return value if value is not None else self._windows_current_percent
             return None
         except Exception:
             logger.exception("Failed to read system volume")
@@ -205,22 +219,13 @@ class SystemVolumeController:
             elif _SYSTEM == "Darwin":
                 subprocess.run(["osascript", "-e", "set volume output muted (output muted of (get volume settings) is false)"], check=False, timeout=1.0)
             elif _SYSTEM == "Windows":
-                endpoint = self._get_windows_endpoint()
-                if endpoint is not None:
-                    muted = endpoint.GetMute()
-                    endpoint.SetMute(0 if muted else 1, None)
+                self._windows_key(self._VK_VOLUME_MUTE)
         except Exception:
             logger.exception("Failed to toggle mute")
 
 
 class ScreenshotService:
-    """Saves the current camera preview frame (with whatever overlays are
-    active) to disk. This is deliberately "camera snapshot", not a
-    full-desktop screenshot -- it's the interpretation that matches both
-    the "Snap -> Take Screenshot" gesture mapping and the dedicated
-    "Camera Snapshot" feature in the spec without building two versions
-    of the same thing.
-    """
+    """Save the current camera frame as a PNG snapshot."""
 
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
@@ -235,7 +240,9 @@ class ScreenshotService:
 
             filename = f"snapshot_{time.strftime('%Y%m%d_%H%M%S')}.png"
             path = self.output_dir / filename
-            cv2.imwrite(str(path), bgr_frame)
+            if not cv2.imwrite(str(path), bgr_frame):
+                logger.warning("OpenCV could not write screenshot: %s", path)
+                return None
             return path
         except Exception:
             logger.exception("Failed to save screenshot")
@@ -243,13 +250,19 @@ class ScreenshotService:
 
 
 class KeyboardAndMediaController:
-    """Optional keyboard-shortcut and media-key simulation, built on
-    ``pyautogui``. Kept entirely optional: if the dependency isn't
-    installed, or there's no display to send synthetic input to (e.g. a
-    headless session), every method silently no-ops after one logged
-    warning rather than raising -- matching the "missing optional
-    dependency" and "invalid configuration" error-handling requirements.
+    """Reliable system media-key controller.
+
+    Windows uses the native multimedia virtual-key codes directly instead of
+    relying on pyautogui's symbolic key-name mapping. This is important because
+    media keys are not ordinary keyboard keys and support varies by pyautogui
+    backend/version. A pyautogui fallback remains available for non-Windows
+    systems and for ordinary hotkeys.
     """
+
+    _VK_MEDIA_PREV = 0xB1
+    _VK_MEDIA_NEXT = 0xB0
+    _VK_MEDIA_PLAY_PAUSE = 0xB3
+    _KEYEVENTF_KEYUP = 0x0002
 
     def __init__(self):
         self._pyautogui = self._try_import()
@@ -258,38 +271,46 @@ class KeyboardAndMediaController:
     def _try_import():
         try:
             import pyautogui
-
             pyautogui.FAILSAFE = False
             return pyautogui
         except Exception as exc:
-            logger.warning("pyautogui unavailable; keyboard/media-key actions are disabled: %s", exc)
+            logger.warning("pyautogui unavailable; keyboard/media-key fallback disabled: %s", exc)
             return None
 
     @property
     def available(self) -> bool:
-        return self._pyautogui is not None
+        return platform.system() == "Windows" or self._pyautogui is not None
 
     def press_hotkey(self, *keys: str) -> None:
-        if not self.available:
+        if self._pyautogui is None:
             return
         try:
             self._pyautogui.hotkey(*keys)
         except Exception:
             logger.exception("Failed to send hotkey %s", keys)
 
-    def media_play_pause(self) -> None:
-        self._press_key_safe("playpause")
+    @staticmethod
+    def _windows_media_key(virtual_key: int) -> None:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.keybd_event(virtual_key, 0, 0, 0)
+        user32.keybd_event(virtual_key, 0, KeyboardAndMediaController._KEYEVENTF_KEYUP, 0)
 
-    def media_next(self) -> None:
-        self._press_key_safe("nexttrack")
-
-    def media_previous(self) -> None:
-        self._press_key_safe("prevtrack")
-
-    def _press_key_safe(self, key: str) -> None:
-        if not self.available:
-            return
+    def _press_key_safe(self, key: str, windows_vk: int) -> None:
         try:
-            self._pyautogui.press(key)
+            if platform.system() == "Windows":
+                self._windows_media_key(windows_vk)
+                return
+            if self._pyautogui is not None:
+                self._pyautogui.press(key)
         except Exception:
             logger.exception("Failed to send media key '%s'", key)
+
+    def media_play_pause(self) -> None:
+        self._press_key_safe("playpause", self._VK_MEDIA_PLAY_PAUSE)
+
+    def media_next(self) -> None:
+        self._press_key_safe("nexttrack", self._VK_MEDIA_NEXT)
+
+    def media_previous(self) -> None:
+        self._press_key_safe("prevtrack", self._VK_MEDIA_PREV)
